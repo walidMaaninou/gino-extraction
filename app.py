@@ -436,6 +436,75 @@ def categorize_charge(description: str) -> str:
     return 'Other'
 
 
+def check_violation(description: str, amount: float, category: str, lease_data: Dict, total_invoice: float) -> tuple:
+    """
+    Check if an invoice line item violates lease terms.
+    Returns (is_violation, reason, explanation)
+    """
+    desc_lower = description.lower()
+    
+    # 1. Check for Utility Admin Fee / Markups (not allowed)
+    utility_markup_keywords = ['utility admin', 'admin fee', 'utility markup', 'utility surcharge', 
+                              'utility processing', 'utility handling', 'utility service fee']
+    if any(keyword in desc_lower for keyword in utility_markup_keywords):
+        return (True, "Utility Admin Fee / Markup", 
+                "Utility markups and administrative fees are typically not allowed unless explicitly stated in the lease. These are pass-through charges and landlords cannot add markups.")
+    
+    # 2. Check for Legal Fees unrelated to Tenant
+    legal_keywords = ['legal fee', 'attorney', 'lawyer', 'legal cost', 'litigation']
+    if any(keyword in desc_lower for keyword in legal_keywords):
+        # Check if it's tenant-related (eviction, collection, etc.)
+        tenant_related = any(term in desc_lower for term in ['eviction', 'collection', 'tenant', 'default', 'breach'])
+        if not tenant_related:
+            return (True, "Legal Fees Unrelated to Tenant", 
+                    "Legal fees that are not related to tenant actions (like eviction or collection) are typically not chargeable to tenants. General legal fees for landlord operations should not be passed through.")
+    
+    # 3. Check for Capital Improvements (like Roof Replacement)
+    capital_improvement_keywords = ['roof', 'capital improvement', 'capital expenditure', 'renovation', 
+                                   'remodeling', 'structural', 'building improvement', 'facility upgrade',
+                                   'hvac replacement', 'plumbing replacement', 'electrical upgrade']
+    if any(keyword in desc_lower for keyword in capital_improvement_keywords):
+        return (True, "Capital Improvement Charge", 
+                "Capital improvements and major repairs (like roof replacement, HVAC systems, structural work) are typically the landlord's responsibility and should not be charged to tenants. These are long-term investments that benefit the property owner.")
+    
+    # 4. Check for Management Fee over 5%
+    management_keywords = ['management fee', 'property management', 'management charge', 'mgmt fee']
+    if any(keyword in desc_lower for keyword in management_keywords):
+        if total_invoice > 0:
+            management_percentage = (amount / total_invoice) * 100
+            if management_percentage > 5:
+                return (True, f"Management Fee Over 5% ({management_percentage:.1f}%)", 
+                        f"Management fees exceeding 5% of total charges are typically excessive. This charge represents {management_percentage:.1f}% of the total invoice, which exceeds the standard 5% cap.")
+            # Also check if management fee is explicitly disallowed
+            disallowed_fees = lease_data.get('disallowed_fees', [])
+            if any('management' in fee.lower() for fee in disallowed_fees):
+                return (True, "Management Fee Not Allowed", 
+                        "Management fees are explicitly disallowed per the lease terms.")
+    
+    # 5. Check against explicit disallowed fees from lease
+    disallowed_fees = lease_data.get('disallowed_fees', [])
+    for disallowed in disallowed_fees:
+        disallowed_lower = disallowed.lower()
+        # Check if disallowed fee appears in description
+        if disallowed_lower in desc_lower or any(word in desc_lower for word in disallowed_lower.split() if len(word) > 3):
+            return (True, f"Disallowed Fee: {disallowed}", 
+                    f"This fee type is explicitly disallowed per the lease terms: '{disallowed}'")
+    
+    # 6. Check for CAM charges that might violate CAM rules
+    if category == 'CAM':
+        cam_rules = lease_data.get('cam_rules', [])
+        # Check if CAM charges seem excessive or include non-CAM items
+        cam_exclusions = ['capital', 'improvement', 'roof', 'structural', 'renovation', 'upgrade']
+        if any(exclusion in desc_lower for exclusion in cam_exclusions):
+            return (True, "Non-CAM Item in CAM Charges", 
+                    "This charge appears to be a capital improvement or non-CAM item incorrectly categorized as CAM. CAM should only include common area maintenance, not capital improvements.")
+    
+    # 7. Check for duplicate charges
+    # This will be handled in the main comparison function
+    
+    return (False, None, None)
+
+
 def compare_lease_invoice(lease_data: Dict, invoice_data: List[Dict]) -> Dict:
     """Compare lease terms with invoice charges and flag mismatches."""
     comparison = {
@@ -450,51 +519,63 @@ def compare_lease_invoice(lease_data: Dict, invoice_data: List[Dict]) -> Dict:
     if not lease_data or not invoice_data:
         return comparison
     
+    # Calculate total invoice first (needed for percentage calculations)
+    total_invoice = sum(item['amount'] for item in invoice_data)
+    
+    # Track seen descriptions to detect duplicates
+    seen_descriptions = {}
+    
     # Check each invoice line item
     for item in invoice_data:
-        description = item['description'].lower()
+        description = item['description']
         amount = item['amount']
         category = item['category']
         
-        is_allowed = True
-        mismatch_reason = None
-        
-        # Check against disallowed fees
-        for disallowed in lease_data.get('disallowed_fees', []):
-            if disallowed.lower() in description:
-                is_allowed = False
-                mismatch_reason = f"Disallowed fee: {disallowed}"
-                comparison['disallowed_charges'].append({
-                    'item': item,
-                    'reason': mismatch_reason
-                })
-                comparison['total_overcharge'] += amount
-                break
-        
-        # Check category-specific rules
-        if category == 'CAM':
-            # Could add CAM-specific validation here
-            pass
-        elif category == 'Tax':
-            # Could validate tax rates here
-            pass
-        
-        if is_allowed:
-            comparison['allowed_charges'].append(item)
-        else:
+        # Check for duplicate charges
+        desc_normalized = description.lower().strip()
+        if desc_normalized in seen_descriptions:
             comparison['mismatches'].append({
                 'item': item,
-                'reason': mismatch_reason,
-                'suggested_action': 'Review with landlord'
+                'reason': 'Duplicate Charge',
+                'explanation': f"Duplicate charge detected. This item appears multiple times in the invoice.",
+                'suggested_action': 'Review with landlord - remove duplicate'
             })
             comparison['overcharges'].append({
-                'description': item['description'],
+                'description': description,
                 'amount': amount,
-                'reason': mismatch_reason
+                'reason': 'Duplicate Charge'
             })
+            comparison['total_overcharge'] += amount
+            continue
+        
+        seen_descriptions[desc_normalized] = True
+        
+        # Check for violations
+        is_violation, violation_reason, explanation = check_violation(
+            description, amount, category, lease_data, total_invoice
+        )
+        
+        if is_violation:
+            comparison['mismatches'].append({
+                'item': item,
+                'reason': violation_reason,
+                'explanation': explanation,
+                'suggested_action': 'Review with landlord - request removal or justification'
+            })
+            comparison['overcharges'].append({
+                'description': description,
+                'amount': amount,
+                'reason': violation_reason
+            })
+            comparison['total_overcharge'] += amount
+            comparison['disallowed_charges'].append({
+                'item': item,
+                'reason': violation_reason
+            })
+        else:
+            comparison['allowed_charges'].append(item)
     
     # Summary statistics
-    total_invoice = sum(item['amount'] for item in invoice_data)
     comparison['summary'] = {
         'total_invoice_amount': total_invoice,
         'total_overcharge': comparison['total_overcharge'],
@@ -622,18 +703,20 @@ def generate_pdf_report(lease_data: Dict, invoice_data: List[Dict], comparison: 
     
     # Mismatches Section
     if comparison and comparison.get('mismatches'):
-        story.append(Paragraph("Flagged Mismatches", heading_style))
-        mismatch_table_data = [['Description', 'Amount', 'Reason', 'Action']]
+        story.append(Paragraph("🚨 Flagged Violations & Overcharges", heading_style))
+        
+        # Create a detailed table with explanations
+        mismatch_table_data = [['Description', 'Amount', 'Violation Type']]
         for mismatch in comparison['mismatches']:
             item = mismatch['item']
+            violation_type = mismatch.get('reason', 'Unknown Violation')
             mismatch_table_data.append([
-                item['description'][:40],
+                item['description'][:45],
                 f"${item['amount']:,.2f}",
-                mismatch['reason'][:30],
-                mismatch.get('suggested_action', 'Review')[:20]
+                violation_type[:35]
             ])
         
-        mismatch_table = Table(mismatch_table_data, colWidths=[2*inch, 1*inch, 2*inch, 1.5*inch])
+        mismatch_table = Table(mismatch_table_data, colWidths=[3*inch, 1*inch, 2.5*inch])
         mismatch_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.darkred),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
@@ -647,6 +730,21 @@ def generate_pdf_report(lease_data: Dict, invoice_data: List[Dict], comparison: 
             ('FONTSIZE', (0, 1), (-1, -1), 9),
         ]))
         story.append(mismatch_table)
+        story.append(Spacer(1, 0.2*inch))
+        
+        # Add detailed explanations for each violation
+        story.append(Paragraph("<b>Violation Details:</b>", styles['Heading3']))
+        for i, mismatch in enumerate(comparison['mismatches'], 1):
+            item = mismatch['item']
+            violation_type = mismatch.get('reason', 'Unknown Violation')
+            explanation = mismatch.get('explanation', 'No explanation provided.')
+            suggested_action = mismatch.get('suggested_action', 'Review with landlord')
+            
+            story.append(Paragraph(f"<b>Violation #{i}: {violation_type}</b>", styles['Normal']))
+            story.append(Paragraph(f"<b>Charge:</b> {item['description']} - ${item['amount']:,.2f}", styles['Normal']))
+            story.append(Paragraph(f"<b>Explanation:</b> {explanation}", styles['Normal']))
+            story.append(Paragraph(f"<b>Recommended Action:</b> {suggested_action}", styles['Normal']))
+            story.append(Spacer(1, 0.15*inch))
     
     # Build PDF
     doc.build(story)
