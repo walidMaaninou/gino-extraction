@@ -68,6 +68,38 @@ def extract_text_from_pdf(pdf_file) -> str:
         return ""
 
 
+def smooth_extracted_text(text: str) -> str:
+    """Clean and smooth extracted text to make it more natural."""
+    if not text:
+        return text
+    
+    # Remove excessive whitespace
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Fix common PDF extraction issues
+    # Join words broken across lines (e.g., "mainte- nance" -> "maintenance")
+    text = re.sub(r'(\w+)-\s+(\w+)', r'\1\2', text)
+    
+    # Fix spacing around punctuation
+    text = re.sub(r'\s+([.,;:!?])', r'\1', text)
+    text = re.sub(r'([.,;:!?])\s*([A-Z])', r'\1 \2', text)
+    
+    # Fix spacing around quotes
+    text = re.sub(r'\s+"', '"', text)
+    text = re.sub(r'"\s+', '" ', text)
+    
+    # Remove orphaned single characters at line starts (common PDF artifact)
+    text = re.sub(r'^\s*[a-zA-Z]\s+', '', text, flags=re.MULTILINE)
+    
+    # Fix multiple spaces
+    text = re.sub(r' {2,}', ' ', text)
+    
+    # Trim and clean
+    text = text.strip()
+    
+    return text
+
+
 def extract_lease_fields(text: str, api_key: str = None) -> Dict:
     """Extract key fields from lease document using OpenAI API."""
     if not api_key:
@@ -174,8 +206,15 @@ def extract_lease_fields(text: str, api_key: str = None) -> Dict:
         prompt = f"""Extract the following key information from this lease document. CRITICAL: Extract the EXACT wording from the lease document - do not paraphrase or summarize. Quote the text verbatim.
 
 For each item, provide:
-1. The EXACT quoted text from the lease (word-for-word, preserving original language)
-2. The clause reference (section number, clause number, paragraph number, etc. - e.g., "Section 5.2", "Clause 12", "Paragraph 3.1")
+1. The EXACT quoted text from the lease (word-for-word, preserving original language, but cleaned up for readability - remove awkward line breaks, fix spacing)
+2. The clause reference (section number, clause number, paragraph number, article number, etc. - look for patterns like "Section 5.2", "Clause 12", "Paragraph 3.1", "Article IV", "§ 5.2", "5.2", etc.)
+
+IMPORTANT FOR CLAUSE REFERENCES:
+- Look for section numbers, clause numbers, paragraph numbers, article numbers, or subsection identifiers near the relevant text
+- Common patterns: "Section X", "Section X.Y", "Clause X", "Paragraph X", "Article X", "§ X", "Subsection X", "Part X"
+- If you see a number followed by text (e.g., "5.2 Common Area Maintenance"), use "Section 5.2" or "Clause 5.2"
+- If multiple references exist, use the most specific one (e.g., "Section 5.2.3" is better than "Section 5")
+- If no explicit reference is found, look for nearby headings or numbered items that might indicate the section
 
 Categories to extract:
 1. CAM Rules: Extract all Common Area Maintenance (CAM) rules, charges, allocation methods, and provisions with exact wording
@@ -189,14 +228,15 @@ Lease Document Text:
 {text}
 
 IMPORTANT: 
-- Copy the exact text from the lease document - do not rephrase or summarize
-- Include clause/section/paragraph references when available
+- Copy the exact text from the lease document - do not rephrase or summarize, but clean up awkward line breaks and spacing
+- ALWAYS try to find a clause/section/paragraph reference - look carefully for numbered sections, clauses, or paragraphs near the relevant text
+- If you cannot find a specific reference, use "See lease document" as a fallback
 - If a category has no information, return an empty array"""
 
         response = client.chat.completions.create(
             model="gpt-4o-2024-08-06",
             messages=[
-                {"role": "system", "content": "You are an expert at extracting structured information from lease documents. Extract EXACT wording verbatim - do not paraphrase, summarize, or reword. Always include clause references when available."},
+                {"role": "system", "content": "You are an expert at extracting structured information from lease documents. Extract EXACT wording verbatim - do not paraphrase, summarize, or reword. Always look carefully for clause/section/paragraph references near the relevant text. Clean up awkward line breaks and spacing in the extracted text for readability."},
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_schema", "json_schema": {"name": "lease_extraction", "strict": True, "schema": lease_schema}}
@@ -205,31 +245,44 @@ IMPORTANT:
         lease_data = json.loads(response.choices[0].message.content)
         lease_data['raw_text'] = text  # Keep original text
         
-        # Keep the new structure with exact_wording and clause_reference
-        # Convert to backward-compatible format for display while preserving exact wording
+        # Smooth extracted wording for all fields
+        def smooth_lease_item(item):
+            if isinstance(item, dict):
+                if 'exact_wording' in item:
+                    item['exact_wording'] = smooth_extracted_text(item['exact_wording'])
+                # Ensure clause_reference is not empty - use fallback if needed
+                if not item.get('clause_reference') or item.get('clause_reference', '').strip() == '':
+                    item['clause_reference'] = 'See lease document'
+            return item
+        
+        # Apply smoothing to all extracted items
+        if isinstance(lease_data.get('cam_rules'), list):
+            lease_data['cam_rules'] = [smooth_lease_item(item) for item in lease_data['cam_rules']]
         if isinstance(lease_data.get('taxes'), list):
-            taxes_list = lease_data.get('taxes', [])
+            taxes_list = [smooth_lease_item(item) for item in lease_data.get('taxes', [])]
             taxes_dict = {}
             for item in taxes_list:
                 taxes_dict[item['type']] = item['exact_wording']
             lease_data['taxes'] = taxes_dict
-            lease_data['taxes_details'] = taxes_list  # Keep full details with clause references
-        
+            lease_data['taxes_details'] = taxes_list
         if isinstance(lease_data.get('utilities'), list):
-            utilities_list = lease_data.get('utilities', [])
+            utilities_list = [smooth_lease_item(item) for item in lease_data.get('utilities', [])]
             utilities_dict = {}
             for item in utilities_list:
                 utilities_dict[item['type']] = item['exact_wording']
             lease_data['utilities'] = utilities_dict
-            lease_data['utilities_details'] = utilities_list  # Keep full details with clause references
-        
+            lease_data['utilities_details'] = utilities_list
         if isinstance(lease_data.get('escalation_caps'), list):
-            escalation_list = lease_data.get('escalation_caps', [])
+            escalation_list = [smooth_lease_item(item) for item in lease_data.get('escalation_caps', [])]
             escalation_dict = {}
             for item in escalation_list:
                 escalation_dict[item['type']] = item['exact_wording']
             lease_data['escalation_caps'] = escalation_dict
-            lease_data['escalation_caps_details'] = escalation_list  # Keep full details with clause references
+            lease_data['escalation_caps_details'] = escalation_list
+        if isinstance(lease_data.get('allowed_fees'), list):
+            lease_data['allowed_fees'] = [smooth_lease_item(item) for item in lease_data['allowed_fees']]
+        if isinstance(lease_data.get('disallowed_fees'), list):
+            lease_data['disallowed_fees'] = [smooth_lease_item(item) for item in lease_data['disallowed_fees']]
         
         return lease_data
         
@@ -498,23 +551,86 @@ def find_relevant_clause(lease_data: Dict, search_term: str, category: str = Non
     if isinstance(disallowed_fees, list):
         for fee_item in disallowed_fees:
             if isinstance(fee_item, dict) and 'exact_wording' in fee_item:
-                if search_term.lower() in fee_item.get('exact_wording', '').lower():
-                    clause_ref = fee_item.get('clause_reference', '')
-                    if clause_ref:
+                exact_wording = fee_item.get('exact_wording', '').lower()
+                if search_term.lower() in exact_wording:
+                    clause_ref = fee_item.get('clause_reference', '').strip()
+                    if clause_ref and clause_ref.lower() != 'see lease document':
                         clause_refs.append(clause_ref)
     
-    # Check CAM rules if category is CAM
-    if category == 'CAM':
+    # Check allowed fees (might have relevant restrictions)
+    allowed_fees = lease_data.get('allowed_fees', [])
+    if isinstance(allowed_fees, list):
+        for fee_item in allowed_fees:
+            if isinstance(fee_item, dict) and 'exact_wording' in fee_item:
+                exact_wording = fee_item.get('exact_wording', '').lower()
+                if search_term.lower() in exact_wording:
+                    clause_ref = fee_item.get('clause_reference', '').strip()
+                    if clause_ref and clause_ref.lower() != 'see lease document':
+                        clause_refs.append(clause_ref)
+    
+    # Check CAM rules if category is CAM or if search term relates
+    if category == 'CAM' or 'cam' in search_term.lower() or 'common area' in search_term.lower():
         cam_rules = lease_data.get('cam_rules', [])
         if isinstance(cam_rules, list):
             for cam_item in cam_rules:
-                if isinstance(cam_item, dict) and 'clause_reference' in cam_item:
-                    clause_ref = cam_item.get('clause_reference', '')
-                    if clause_ref:
+                if isinstance(cam_item, dict):
+                    clause_ref = cam_item.get('clause_reference', '').strip()
+                    if clause_ref and clause_ref.lower() != 'see lease document':
                         clause_refs.append(clause_ref)
     
-    # Return first found clause reference, or empty string
-    return clause_refs[0] if clause_refs else ""
+    # Check utilities if relevant
+    if 'utility' in search_term.lower() or category == 'Utilities':
+        utilities_details = lease_data.get('utilities_details', [])
+        if isinstance(utilities_details, list):
+            for util_item in utilities_details:
+                if isinstance(util_item, dict):
+                    clause_ref = util_item.get('clause_reference', '').strip()
+                    if clause_ref and clause_ref.lower() != 'see lease document':
+                        clause_refs.append(clause_ref)
+    
+    # Check taxes if relevant
+    if 'tax' in search_term.lower() or category == 'Tax':
+        taxes_details = lease_data.get('taxes_details', [])
+        if isinstance(taxes_details, list):
+            for tax_item in taxes_details:
+                if isinstance(tax_item, dict):
+                    clause_ref = tax_item.get('clause_reference', '').strip()
+                    if clause_ref and clause_ref.lower() != 'see lease document':
+                        clause_refs.append(clause_ref)
+    
+    # Check escalation caps if relevant
+    if 'escalation' in search_term.lower() or 'cap' in search_term.lower():
+        escalation_details = lease_data.get('escalation_caps_details', [])
+        if isinstance(escalation_details, list):
+            for esc_item in escalation_details:
+                if isinstance(esc_item, dict):
+                    clause_ref = esc_item.get('clause_reference', '').strip()
+                    if clause_ref and clause_ref.lower() != 'see lease document':
+                        clause_refs.append(clause_ref)
+    
+    # Return first found clause reference, or try to find any clause reference as fallback
+    if clause_refs:
+        return clause_refs[0]
+    
+    # Fallback: search all lease sections for any clause reference
+    all_sections = [
+        lease_data.get('cam_rules', []),
+        lease_data.get('disallowed_fees', []),
+        lease_data.get('allowed_fees', []),
+        lease_data.get('utilities_details', []),
+        lease_data.get('taxes_details', []),
+        lease_data.get('escalation_caps_details', [])
+    ]
+    
+    for section in all_sections:
+        if isinstance(section, list):
+            for item in section:
+                if isinstance(item, dict):
+                    clause_ref = item.get('clause_reference', '').strip()
+                    if clause_ref and clause_ref.lower() != 'see lease document':
+                        return clause_ref
+    
+    return ""
 
 
 def check_violation(description: str, amount: float, category: str, lease_data: Dict, total_invoice: float) -> tuple:
@@ -529,6 +645,8 @@ def check_violation(description: str, amount: float, category: str, lease_data: 
                               'utility processing', 'utility handling', 'utility service fee']
     if any(keyword in desc_lower for keyword in utility_markup_keywords):
         clause_ref = find_relevant_clause(lease_data, 'utility', 'Utilities')
+        if not clause_ref:
+            clause_ref = find_relevant_clause(lease_data, 'disallowed', None)
         clause_text = f" (See {clause_ref})" if clause_ref else ""
         return (True, "Utility Admin Fee / Markup", 
                 f"Utility markups and administrative fees are typically not allowed unless explicitly stated in the lease{clause_text}. These are pass-through charges and landlords cannot add markups.",
@@ -588,10 +706,13 @@ def check_violation(description: str, amount: float, category: str, lease_data: 
     for disallowed in disallowed_fees:
         if isinstance(disallowed, dict):
             disallowed_text = disallowed.get('exact_wording', '')
-            clause_ref = disallowed.get('clause_reference', '')
+            clause_ref = disallowed.get('clause_reference', '').strip()
+            # Use fallback if clause_ref is empty or generic
+            if not clause_ref or clause_ref.lower() == 'see lease document':
+                clause_ref = find_relevant_clause(lease_data, 'disallowed', None)
         else:
             disallowed_text = str(disallowed)
-            clause_ref = ''
+            clause_ref = find_relevant_clause(lease_data, 'disallowed', None)
         
         disallowed_lower = disallowed_text.lower()
         # Check if disallowed fee appears in description
@@ -971,7 +1092,7 @@ with tab1:
                                 for cam_item in cam_rules:
                                     cam_data.append({
                                         'Exact Wording': cam_item.get('exact_wording', ''),
-                                        'Clause Reference': cam_item.get('clause_reference', 'N/A')
+                                        'Clause Reference': cam_item.get('clause_reference', '').strip() or 'See lease document'
                                     })
                                 cam_df = pd.DataFrame(cam_data)
                             else:
@@ -987,7 +1108,7 @@ with tab1:
                                     tax_data.append({
                                         'Tax Type': tax_item.get('type', ''),
                                         'Exact Wording': tax_item.get('exact_wording', ''),
-                                        'Clause Reference': tax_item.get('clause_reference', 'N/A')
+                                        'Clause Reference': tax_item.get('clause_reference', '').strip() or 'See lease document'
                                     })
                                 tax_df = pd.DataFrame(tax_data)
                             else:
@@ -1006,7 +1127,7 @@ with tab1:
                                     util_data.append({
                                         'Utility Type': util_item.get('type', ''),
                                         'Exact Wording': util_item.get('exact_wording', ''),
-                                        'Clause Reference': util_item.get('clause_reference', 'N/A')
+                                        'Clause Reference': util_item.get('clause_reference', '').strip() or 'See lease document'
                                     })
                                 util_df = pd.DataFrame(util_data)
                             else:
@@ -1025,7 +1146,7 @@ with tab1:
                                     esc_data.append({
                                         'Type': esc_item.get('type', ''),
                                         'Exact Wording': esc_item.get('exact_wording', ''),
-                                        'Clause Reference': esc_item.get('clause_reference', 'N/A')
+                                        'Clause Reference': esc_item.get('clause_reference', '').strip() or 'See lease document'
                                     })
                                 esc_df = pd.DataFrame(esc_data)
                             else:
@@ -1043,7 +1164,7 @@ with tab1:
                                 for fee_item in allowed_fees:
                                     allowed_data.append({
                                         'Exact Wording': fee_item.get('exact_wording', ''),
-                                        'Clause Reference': fee_item.get('clause_reference', 'N/A')
+                                        'Clause Reference': fee_item.get('clause_reference', '').strip() or 'See lease document'
                                     })
                                 allowed_df = pd.DataFrame(allowed_data)
                             else:
@@ -1058,7 +1179,7 @@ with tab1:
                                 for fee_item in disallowed_fees:
                                     disallowed_data.append({
                                         'Exact Wording': fee_item.get('exact_wording', ''),
-                                        'Clause Reference': fee_item.get('clause_reference', 'N/A')
+                                        'Clause Reference': fee_item.get('clause_reference', '').strip() or 'See lease document'
                                     })
                                 disallowed_df = pd.DataFrame(disallowed_data)
                             else:
@@ -1146,10 +1267,12 @@ with tab2:
                         st.write(f"**Amount:** ${item['amount']:,.2f}")
                         st.write(f"**Category:** {item.get('category', 'N/A')}")
                     with col2:
-                        if clause_ref:
+                        if clause_ref and clause_ref.lower() != 'see lease document':
                             st.info(f"📋 **Clause Reference:**\n{clause_ref}")
+                        elif clause_ref:
+                            st.caption(f"📋 {clause_ref}")
                         else:
-                            st.warning("⚠️ No clause reference found")
+                            st.caption("📋 Clause reference not available")
                     
                     st.write("**Explanation:**")
                     st.write(explanation)
