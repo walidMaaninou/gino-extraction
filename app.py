@@ -22,6 +22,18 @@ st.set_page_config(
     layout="wide"
 )
 
+# Hide Streamlit footer and menu
+hide_streamlit_style = """
+    <style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    .stDeployButton {visibility: hidden;}
+    [data-testid="stToolbar"] {visibility: hidden;}
+    </style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+
 st.title("📄 Lease & Invoice Analyzer")
 st.markdown("Upload lease documents and invoices to extract key fields and identify mismatches.")
 
@@ -697,7 +709,7 @@ def check_violation(description: str, amount: float, category: str, lease_data: 
                     if 'management' in fee_text.lower():
                         clause_ref = fee_item.get('clause_reference', '') if isinstance(fee_item, dict) else ''
                         clause_text = f" (See {clause_ref})" if clause_ref else ""
-                        return (True, "Management Fee Not Allowed", 
+                return (True, "Management Fee Not Allowed", 
                                 f"Management fees are explicitly disallowed per the lease terms{clause_text}.",
                                 clause_ref)
     
